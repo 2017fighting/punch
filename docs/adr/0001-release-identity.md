@@ -3,17 +3,22 @@
 **Status**: accepted (2026-11-26)
 
 punch ships two binaries from one Go module, so one `vX.Y.Z` tag names a release and both binaries move
-together. CI used to publish `main` + `latest` on every push to the branch; that stopped: only
-`refs/tags/v*` publishes now, and the tag is baked into both binaries (`-X main.version`) so a running
-process can answer `punchd -version`. The reason is on the consumer side — a rolling tag is an identity
+together. CI used to publish `main` on every push to the branch; that stopped: only `refs/tags/v*`
+publishes now, and the tag is baked into both binaries (`-X main.version`) so a running process can
+answer `punchd -version`. The reason is on the consumer side — a rolling tag is an identity
 nothing can follow. home-ops' Renovate can only compare `vX.Y.Z` (and its built-in `kubernetes` manager
 does not scan `infrastructure/` at all, so that repo carries a customManager row for this one file), and a
 pin with no version signal ages silently, which is the failure ADR-0017 already recorded twice.
 
 ## Consequences
 
-- `main` and `latest` are retired: a branch build still produces artifacts but publishes no image.
-  Anything that wants bytes pins a tag, or the `sha-<short>` tag that mirrors it.
+- `main` is retired: a branch build still produces artifacts but publishes no image, and the
+  leftover `:main` tag in the registry was deleted. Anything that wants bytes pins a tag, or the
+  `sha-<short>` tag that mirrors it.
+- `latest` stays, and means "the newest release", not "the newest commit": `docker/metadata-action`'s
+  default `flavor: latest=auto` adds it to any semver tag, so it moves only when a `vX.Y.Z` is cut.
+  It is a convenience alias and never a pin — Renovate tracks the version tags, and home-ops pins
+  `:vX.Y.Z` explicitly.
 - The OpenWrt feed keeps a **commit** pin, not a tag pin: the tag's commit as the sha, its date as
   `PKG_VERSION`. `apk` orders by that date only, and `2026.11.26` sorts above `0.1.0`, so a version-number
   switch would read as a downgrade on every installed device. The feed follows releases by moving the pin.

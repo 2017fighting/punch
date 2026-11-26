@@ -266,7 +266,10 @@ CI (`.github/workflows/ci.yml`) runs `go vet`, `go test` and builds **both binar
 linux/arm64** on every branch and PR, but **only a `v*` tag publishes**: it uploads `punchd` as the
 workflow artifacts `punchd-linux-amd64` / `punchd-linux-arm64` and pushes
 `ghcr.io/2017fighting/punch-controller` with `GITHUB_TOKEN`, under the tag `vX.Y.Z` (plus
-`sha-<short>`). No branch tag, no `latest` — a rolling tag is an identity nothing can follow.
+`sha-<short>`). No branch tag: `:main` was retired because a rolling branch tag is an identity
+nothing can follow. `:latest` still exists and follows the newest release (metadata-action's default
+`flavor: latest=auto` adds it to any semver tag) — it is a convenience alias, never a pin; the
+[Release](#release) section pins the tag.
 
 ### Release
 
