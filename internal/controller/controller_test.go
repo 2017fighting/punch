@@ -134,7 +134,7 @@ func TestStatusEndpointLastSeenIsTheControllersClock(t *testing.T) {
 	}
 }
 
-func TestStatusEndpointDownDeletesConfigMap(t *testing.T) {
+func TestStatusEndpointDownWritesDownDocument(t *testing.T) {
 	now := mustTime(t, t0)
 	p := testPunch("qb-private", "apps", "192.168.9.70:6881", 27257)
 	c, client := newTestController(t, now, time.Minute, p)
@@ -152,8 +152,14 @@ func TestStatusEndpointDownDeletesConfigMap(t *testing.T) {
 	if rec := doRequest(t, h, http.MethodPost, "/punches/status", body, true); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
 	}
-	if configMapExists(t, c, "apps", "qb-private-punch") {
-		t.Fatal("a down report must delete the ConfigMap: an absent file means the punch is not up")
+	// The object STAYS and says "down": a deletion never reaches a running pod's volume
+	// (kubelet keeps the last payload), so absence cannot be the signal.
+	doc := configMapDoc(t, c, "apps", "qb-private-punch")
+	if doc == "" {
+		t.Fatal("a down report must leave the ConfigMap in place carrying a down document")
+	}
+	if !saysDown(t, doc) {
+		t.Errorf("document after a down report = %q, want no public tuple", doc)
 	}
 	got := getPunch(t, c, "apps", "qb-private")
 	if got.Status.State != v1alpha1.StateDown || !strings.Contains(got.Status.Reason, "natmap exited") {
@@ -165,8 +171,9 @@ func TestStatusEndpointDownDeletesConfigMap(t *testing.T) {
 	}
 }
 
-// TestStatusEndpointPendingKeepsConfigMap absent: `pending` means "never mapped", so it
-// must not resurrect the file and must not delete a live one either.
+// TestStatusEndpointPending: `pending` means "never mapped", which is said the same way
+// `down` is said — in the document — so an app can be up and halted instead of blocked on
+// a ConfigMap that may not exist yet.
 func TestStatusEndpointPending(t *testing.T) {
 	p := testPunch("hath", "apps", "192.168.9.71:44388", 44388)
 	c, _ := newTestController(t, mustTime(t, t0), time.Minute, p)
@@ -176,8 +183,12 @@ func TestStatusEndpointPending(t *testing.T) {
 	if rec := doRequest(t, h, http.MethodPost, "/punches/status", body, true); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
 	}
-	if configMapExists(t, c, "apps", "hath-punch") {
-		t.Error("a pending punch must not publish a port")
+	doc := configMapDoc(t, c, "apps", "hath-punch")
+	if doc == "" {
+		t.Error("a pending punch must publish a document that says it has no mapping")
+	}
+	if !saysDown(t, doc) {
+		t.Errorf("document for a pending punch = %q, want no public tuple", doc)
 	}
 	got := getPunch(t, c, "apps", "hath")
 	if got.Status.State != v1alpha1.StatePending || got.Status.Reason != "natmap has not reported a mapping yet" {
@@ -186,8 +197,8 @@ func TestStatusEndpointPending(t *testing.T) {
 }
 
 // TestStatusEndpointBindPortConflict: the agent can be right and the declaration wrong;
-// the controller's verdict wins, and no ConfigMap is published for a port two punches
-// claim (there is no admission webhook to catch it earlier).
+// the controller's verdict wins: a port two punches claim publishes no public tuple (there
+// is no admission webhook to catch it earlier).
 func TestStatusEndpointBindPortConflict(t *testing.T) {
 	p1 := testPunch("qb-private", "apps-qb", "192.168.9.70:6881", 27257)
 	p2 := testPunch("hath", "apps-hath", "192.168.9.71:44388", 27257)
@@ -205,8 +216,10 @@ func TestStatusEndpointBindPortConflict(t *testing.T) {
 		if got.Status.State != v1alpha1.StateDown || got.Status.Reason != v1alpha1.ReasonBindPortConflict {
 			t.Errorf("%s: status = %q/%q, want down/bindPortConflict", tc.name, got.Status.State, got.Status.Reason)
 		}
-		if configMapExists(t, c, tc.ns, tc.name+"-punch") {
-			t.Errorf("%s: a conflicting punch must not publish a ConfigMap", tc.name)
+		// A conflicting declaration publishes no PORT — the document still exists and
+		// says so, because "there is no mapping" is what the app has to act on.
+		if doc := configMapDoc(t, c, tc.ns, tc.name+"-punch"); doc == "" || !saysDown(t, doc) {
+			t.Errorf("%s: a conflicting punch must publish a down document, got %q", tc.name, doc)
 		}
 	}
 }
@@ -306,15 +319,15 @@ func TestReconcileDeadlineAndConfigMapLifecycle(t *testing.T) {
 	if want := "no status from the punch agent for 120s"; got.Status.Reason != want {
 		t.Errorf("reason = %q, want %q", got.Status.Reason, want)
 	}
-	if configMapExists(t, c, "apps-qb", "qb-private-punch") {
-		t.Error("down must delete the ConfigMap")
+	if doc := configMapDoc(t, c, "apps-qb", "qb-private-punch"); doc == "" || !saysDown(t, doc) {
+		t.Errorf("a punch silent for 2m must say down in its document, got %q", doc)
 	}
 
 	if got := getPunch(t, c, "infra", "speedtest"); got.Status.State != v1alpha1.StatePending {
 		t.Errorf("a never-reported punch must be pending, got %q", got.Status.State)
 	}
-	if configMapExists(t, c, "infra", "speedtest-punch") {
-		t.Error("pending must not publish a ConfigMap")
+	if doc := configMapDoc(t, c, "infra", "speedtest-punch"); doc == "" || !saysDown(t, doc) {
+		t.Errorf("a never-reported punch must publish a down document, got %q", doc)
 	}
 
 	if got := getPunch(t, c, "apps-hath", "hath"); got.Status.State != v1alpha1.StateUp {
@@ -322,6 +335,30 @@ func TestReconcileDeadlineAndConfigMapLifecycle(t *testing.T) {
 	}
 	if !configMapExists(t, c, "apps-hath", "hath-punch") {
 		t.Error("up must keep the ConfigMap")
+	}
+}
+
+// TestReconcileDoesNotRewriteTheDownDocument: the resync runs every 15s, and a punch that
+// stays down would otherwise rewrite the same object forever. Content decides, so a
+// second pass must write nothing.
+func TestReconcileDoesNotRewriteTheDownDocument(t *testing.T) {
+	now := mustTime(t, t0)
+	p := testPunch("hath", "apps-hath", "192.168.9.71:44388", 44388)
+	p.Status = v1alpha1.PunchStatus{State: v1alpha1.StateUp, PublicIP: "120.244.157.23",
+		PublicPort: 38697, InnerPort: 44388, LastSeenAt: metav1.NewTime(now.Add(-2 * time.Minute))}
+	c, _ := newTestController(t, now, time.Minute, p)
+
+	if err := c.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := c.writes.Load(); got != 1 {
+		t.Fatalf("writes after the first reconcile = %d, want 1 (the down document)", got)
+	}
+	if err := c.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := c.writes.Load(); got != 1 {
+		t.Errorf("writes after an unchanged second reconcile = %d, want 1: the resync must not rewrite", got)
 	}
 }
 

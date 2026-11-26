@@ -196,3 +196,24 @@ func configMapExists(t *testing.T, c *Controller, ns, name string) bool {
 	_, err := c.dyn.Resource(configMapGVR).Namespace(ns).Get(t.Context(), name, metav1.GetOptions{})
 	return err == nil
 }
+
+// configMapDoc reads the document out of a ConfigMap, or "" when either is missing.
+func configMapDoc(t *testing.T, c *Controller, ns, name string) string {
+	t.Helper()
+	cm, err := c.dyn.Resource(configMapGVR).Namespace(ns).Get(t.Context(), name, metav1.GetOptions{})
+	if err != nil {
+		return ""
+	}
+	return PunchDocOf(cm)
+}
+
+// saysDown reports whether the document carries no public tuple, which is how a punch
+// says "I am not up" — the file's presence says nothing (see BuildDownConfigMap).
+func saysDown(t *testing.T, doc string) bool {
+	t.Helper()
+	var d PunchDoc
+	if err := json.Unmarshal([]byte(doc), &d); err != nil {
+		t.Fatalf("document %q is not a punch document: %v", doc, err)
+	}
+	return d.IP == "" && d.Port == 0
+}

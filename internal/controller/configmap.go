@@ -66,20 +66,49 @@ func CheckConfigMapName(punchName, cmName string) error {
 // `punch.json`, ownerReference to the CR (controller: true, so deleting the CR garbage
 // collects it), in the CR's own namespace.
 func BuildConfigMap(p *v1alpha1.Punch, publicIP string, publicPort int32) (*unstructured.Unstructured, error) {
-	name, err := ConfigMapNameFor(p.Name)
-	if err != nil {
-		return nil, err
-	}
 	if publicIP == "" || publicPort <= 0 {
-		return nil, fmt.Errorf("punch %s/%s: refusing to write a ConfigMap for a mapping without a public tuple (ip=%q port=%d)",
+		return nil, fmt.Errorf("punch %s/%s: refusing to write a mapping without a public tuple (ip=%q port=%d)",
 			p.Namespace, p.Name, publicIP, publicPort)
 	}
-	doc, err := PunchDoc{
+	return buildConfigMap(p, PunchDoc{
 		IP:        publicIP,
 		Port:      publicPort,
 		InnerPort: p.Spec.BindPort,
 		Protocol:  strings.ToLower(p.Spec.EffectiveProtocol()),
-	}.Encode()
+	})
+}
+
+// BuildDownConfigMap renders the SAME object for a punch that is not up: one key,
+// `punch.json`, holding a document with no public tuple — `"ip":""` and `"port":0`, which
+// every consumer already treats as "no mapping" (the qBittorrent sidecar validates
+// 1..65535, hath's fork rejects an empty ip and port 0, and both predate this).
+//
+// WHY THE DOCUMENT AND NOT A DELETION. A `down` punch used to DELETE the ConfigMap, on the
+// theory that a running app would see the file disappear. It does not: kubelet never
+// removes a mounted ConfigMap's files, so a deleted ConfigMap leaves the last payload in
+// the volume forever and the app cannot tell "down" from "up" (measured 2026-11-26 on the
+// home-ops cluster: `punch.json` was byte-identical 2.5 minutes after the object was gone,
+// with only `MountVolume.SetUp failed … not found` in the events). An UPDATE is projected
+// (~60–90s), so "down" has to be written, and the app reads the content — never the
+// presence — of the file.
+func BuildDownConfigMap(p *v1alpha1.Punch) (*unstructured.Unstructured, error) {
+	return buildConfigMap(p, PunchDoc{
+		IP:        "",
+		Port:      0,
+		InnerPort: p.Spec.BindPort,
+		Protocol:  strings.ToLower(p.Spec.EffectiveProtocol()),
+	})
+}
+
+// buildConfigMap renders the object around one document. Both the `up` and the `down`
+// shape go through here, so name, labels, ownerReference and key cannot drift between
+// them: a punch's ConfigMap differs only in what its single key says.
+func buildConfigMap(p *v1alpha1.Punch, punchDoc PunchDoc) (*unstructured.Unstructured, error) {
+	name, err := ConfigMapNameFor(p.Name)
+	if err != nil {
+		return nil, err
+	}
+	doc, err := punchDoc.Encode()
 	if err != nil {
 		return nil, err
 	}
@@ -116,8 +145,17 @@ func BuildConfigMap(p *v1alpha1.Punch, publicIP string, publicPort int32) (*unst
 	return cm, nil
 }
 
-// isNotFound reports whether err is an apiserver NotFound, which for a delete means
-// "already gone" — the desired end state.
+// PunchDocOf reads the document out of a ConfigMap, or "" when the object carries none.
+// The resync compares it before writing: the same bytes again are etcd churn and a
+// pointless kubelet projection, and the comparison is on content because content is what
+// the mounts show.
+func PunchDocOf(cm *unstructured.Unstructured) string {
+	doc, _, _ := unstructured.NestedString(cm.Object, "data", v1alpha1.ConfigMapKey)
+	return doc
+}
+
+// isNotFound reports whether err is an apiserver NotFound — the object is not there, so
+// there is nothing to compare against and the caller should write.
 func isNotFound(err error) bool {
 	return apierrors.IsNotFound(err)
 }

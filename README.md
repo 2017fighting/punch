@@ -70,8 +70,13 @@ Endpoints:
   `/status` subresource, and:
   - `up` → writes `<name>-punch` (key `punch.json`, `{ip,port,inner_port,protocol}`, ownerReference to
     the CR with `controller: true`, in the CR's namespace);
-  - `down` → deletes it (absent file means "not up");
-  - `pending` → leaves it alone.
+  - `pending` or `down` → writes the SAME object with a **down document**, `{"ip":"","port":0,…}`,
+    which is how "there is no mapping" is said. Not a deletion: kubelet never removes a deleted
+    ConfigMap's files from a running pod's volume, so an app cannot see absence (ADR-0044 amendment,
+    2026-11-26 — measured on this cluster before it was believed).
+
+  Whichever it is, the write is skipped when the live object already carries that exact document, so
+  a steady state costs no writes.
 - `GET /metrics` → Prometheus text format, **unauthenticated** (scraped in-cluster; the HTTPRoute only
   routes `/punches/...`).
 
@@ -102,9 +107,16 @@ Punch's namespace, with exactly one key, `punch.json`, holding natmap's document
 {"ip":"120.244.157.23","port":38698,"inner_port":27257,"protocol":"tcp"}
 ```
 
-Consumers open that key by name (`/punch/punch.json`). `CheckConfigMapName` refuses any other name, any
-other namespace, and any object that is not derived from the CR — RBAC cannot express "the name is
-derived from a Punch", so the code does.
+Consumers open that key by name (`/punch/punch.json`) and read the CONTENT, never the presence:
+
+```json
+{"ip":"","port":0,"inner_port":27257,"protocol":"tcp"}
+```
+
+— that is the same key for a punch that is not up, and it is the only signal a running app can see
+(kubelet keeps a deleted ConfigMap's last payload in the volume, so "the file disappeared" happens
+nowhere). `CheckConfigMapName` refuses any other name, any other namespace, and any object that is not
+derived from the CR — RBAC cannot express "the name is derived from a Punch", so the code does.
 
 ### State machine (one place, `internal/controller/state.go`)
 
@@ -115,8 +127,9 @@ derived from a Punch", so the code does.
 | `now - lastSeenAt > deadline` | `down` | `no status from the punch agent for <N>s` |
 | otherwise | what the agent said | what the agent said |
 
-Deleting the ConfigMap happens **only** in `down`; `up` keeps it (and recreates it if someone removed it
-by hand); `pending` neither writes nor deletes.
+The ConfigMap exists from the moment the controller has seen the CR: `up` writes the public tuple,
+`pending` and `down` write the down document, and a hand-edited document is repaired on the next
+resync. Nothing deletes it except the CR's own deletion, through the `ownerReference`.
 
 ## `punchd`
 
