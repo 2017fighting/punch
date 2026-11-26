@@ -34,9 +34,11 @@ A `vX.Y.Z` git tag — this project's release identity. It is what CI bakes into
 _Avoid_: release number (a tag names a commit; there is no separate release record)
 
 **Rolling tag**:
-A tag whose content moves under a fixed name (`main`, `latest`). Retired in `docs/adr/0001`: it names a
-branch, so nothing can tell that it fell behind.
-_Avoid_: latest, branch tag
+A tag whose content moves under a fixed name instead of naming one release. `main` was one and is
+retired (`docs/adr/0001`): it named a branch, so nothing could tell that it had fallen behind.
+`latest` is still published, but it moves only when a release is cut — it is an alias for the newest
+version tag, never a pin, and nothing pins it.
+_Avoid_: branch tag
 
 **Pin**:
 A specific commit a consumer pins instead of following a branch. The OpenWrt feed pins a 40-hex sha (and

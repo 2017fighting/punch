@@ -91,12 +91,11 @@ jobs:
   image:
     name: build and push punch-controller
     needs: test
-    # ONLY A TAG PUBLISHES. A branch push used to push `main` + `latest`, and that rolling
-    # tag is exactly the shape nothing can follow: home-ops' Renovate row can only track a
-    # `vX.Y.Z` tag, so a branch build was an identity with no version signal (the failure
-    # ADR-0017 named). Retired on purpose in docs/adr/0001. A pull request still builds
-    # nothing here: the registry credential is the workflow token, and an unmerged commit
-    # needs no identity.
+    # ONLY A TAG PUBLISHES. A branch push used to push `main`, and that rolling branch tag is
+    # exactly the shape nothing can follow: home-ops' Renovate row can only track a `vX.Y.Z` tag,
+    # so a branch build was an identity with no version signal (the failure ADR-0017 named).
+    # Retired on purpose in docs/adr/0001. A pull request still builds nothing here: the registry
+    # credential is the workflow token, and an unmerged commit needs no identity.
     if: >-
       github.event_name == 'push' &&
       startsWith(github.ref, 'refs/tags/v')
@@ -123,9 +122,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/2017fighting/punch-controller
-          # No `type=ref,event=branch` and no `latest`: the tag is the version and the only
-          # thing consumers pin. `sha-<short>` stays as the content-addressed escape hatch
-          # for "show me the bytes this tag came from".
+          # No `type=ref,event=branch`: the tag is the version and the only thing consumers pin.
+          # metadata-action's default `flavor: latest=auto` still adds `latest` to a semver tag,
+          # and that is fine — it means "the newest release", it moves only when a `vX.Y.Z` is cut,
+          # and nothing pins it (home-ops pins `:vX.Y.Z`). `sha-<short>` stays as the
+          # content-addressed escape hatch for "the bytes this tag came from".
           tags: |
             type=ref,event=tag
             type=sha,prefix=sha-
