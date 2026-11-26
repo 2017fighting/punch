@@ -80,7 +80,7 @@ func TestParseConfigErrors(t *testing.T) {
 	base := "cluster_url = https://punch.raenzo.com\ntoken = t\nstun = s\nhttp = h\niface = i\n"
 	for _, tc := range []struct{ name, body, want string }{
 		{"unknown key", base + "nft_pth = /x\n", "unknown key"},
-		{"missing required", "cluster_url = https://x\n", "token is required"},
+		{"missing required", "cluster_url = https://x\n", "token or token_file is required"},
 		{"not key-value", base + "oops\n", "key = value"},
 		{"bad url", "cluster_url = punch.raenzo.com\ntoken = t\nstun = s\nhttp = h\niface = i\n", "http(s) URL"},
 		{"duplicate key", base + "token = twice\n", "duplicate key"},
@@ -115,5 +115,55 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if _, err := LoadConfig(filepath.Join(dir, "absent.conf")); err == nil {
 		t.Error("a missing config file must be an error, not an empty config")
+	}
+}
+
+// token_file is the router's shape: the bearer token lives in a device-local 0600
+// file, not in a world-readable config that ships in the firmware image.
+func TestLoadConfigResolvesTokenFile(t *testing.T) {
+	dir := t.TempDir()
+	tok := filepath.Join(dir, "token")
+	if err := os.WriteFile(tok, []byte("  s3cret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "punch.conf")
+	body := "cluster_url = https://punch.raenzo.com\n" +
+		"token_file = " + tok + "\n" +
+		"stun = stun.m-online.net\nhttp = www.baidu.com\niface = pppoe-wan\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Token != "s3cret" {
+		t.Fatalf("token = %q, want the trimmed file content", cfg.Token)
+	}
+}
+
+func TestLoadConfigRejectsMissingTokenFileAndAmbiguity(t *testing.T) {
+	dir := t.TempDir()
+	base := "cluster_url = https://punch.raenzo.com\n" +
+		"stun = stun.m-online.net\nhttp = www.baidu.com\niface = pppoe-wan\n"
+
+	missing := filepath.Join(dir, "missing.conf")
+	if err := os.WriteFile(missing, []byte(base+"token_file = "+filepath.Join(dir, "nope")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(missing); err == nil {
+		t.Fatal("an unreadable token_file must be an error")
+	}
+
+	both := filepath.Join(dir, "both.conf")
+	tok := filepath.Join(dir, "token")
+	if err := os.WriteFile(tok, []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(both, []byte(base+"token = inline\ntoken_file = "+tok+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(both); err == nil {
+		t.Fatal("token and token_file together must be rejected, not silently ranked")
 	}
 }

@@ -22,7 +22,8 @@ const (
 // in the cluster (ADR-0044: the router is a dumb actuator).
 //
 //	cluster_url = https://punch.raenzo.com
-//	token       = <the bearer token, same value as the controller's PUNCH_BEARER_TOKEN>
+//	token_file  = /etc/punch/token   # 0600 file holding the bearer token (preferred)
+//	token       = <inline bearer token>   # alternative; exactly one of the two
 //	stun        = stun.m-online.net
 //	http        = www.baidu.com
 //	iface       = pppoe-wan
@@ -33,6 +34,7 @@ const (
 type Config struct {
 	ClusterURL string
 	Token      string
+	TokenFile  string
 	STUN       string
 	HTTP       string
 	Iface      string
@@ -78,6 +80,8 @@ func ParseConfig(data []byte) (Config, error) {
 			cfg.ClusterURL = val
 		case "token":
 			cfg.Token = val
+		case "token_file":
+			cfg.TokenFile = val
 		case "stun":
 			cfg.STUN = val
 		case "http":
@@ -101,7 +105,7 @@ func ParseConfig(data []byte) (Config, error) {
 			}
 			cfg.Interval = d
 		default:
-			return Config{}, fmt.Errorf("line %d: unknown key %q (known: cluster_url, token, stun, http, iface, state_dir, nft_path, fwmark, interval)", i+1, key)
+			return Config{}, fmt.Errorf("line %d: unknown key %q (known: cluster_url, token, token_file, stun, http, iface, state_dir, nft_path, fwmark, interval)", i+1, key)
 		}
 	}
 	if err := cfg.validate(); err != nil {
@@ -120,20 +124,40 @@ func LoadConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("config %s: %w", path, err)
 	}
+	// token_file is resolved here, not in ParseConfig: parsing stays pure, and a
+	// device-local 0600 file (the router's shape, like router-backup/secrets.conf)
+	// is the preferred home for the bearer token.
+	if cfg.TokenFile != "" {
+		raw, err := os.ReadFile(cfg.TokenFile)
+		if err != nil {
+			return Config{}, fmt.Errorf("read token_file %s: %w", cfg.TokenFile, err)
+		}
+		cfg.Token = strings.TrimSpace(string(raw))
+		if cfg.Token == "" {
+			return Config{}, fmt.Errorf("token_file %s is empty", cfg.TokenFile)
+		}
+	}
 	return cfg, nil
 }
 
 func (c *Config) validate() error {
 	var problems []string
+	token := c.Token
+	if token == "" {
+		token = c.TokenFile
+	}
 	for _, f := range []struct{ key, val string }{
 		{"cluster_url", c.ClusterURL},
-		{"token", c.Token},
+		{"token or token_file", token},
 		{"stun", c.STUN},
 		{"http", c.HTTP},
 		{"iface", c.Iface},
 	} {
 		if f.val == "" {
 			problems = append(problems, f.key+" is required")
+		}
+		if f.key == "token or token_file" && c.Token != "" && c.TokenFile != "" {
+			problems = append(problems, "token and token_file are both set: pick one")
 		}
 	}
 	if c.ClusterURL != "" {
