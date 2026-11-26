@@ -27,6 +27,11 @@ import (
 	"github.com/2017fighting/punch/internal/controller"
 )
 
+// version is the release identity, baked in at link time by CI (`-X main.version=v0.1.0`).
+// The image tag is the release identity for the cluster; this one line is what makes the
+// running process agree with the tag it was built from (a plain `go build` says "dev").
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		slog.Error("punch-controller exiting", "err", err)
@@ -57,6 +62,7 @@ func run() error {
 	}
 	log := slog.New(handler)
 	slog.SetDefault(log)
+	log.Info("punch-controller", "version", version)
 
 	token := os.Getenv(*tokenEnv)
 	if token == "" {

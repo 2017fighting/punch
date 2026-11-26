@@ -20,6 +20,11 @@ import (
 	"github.com/2017fighting/punch/internal/agent"
 )
 
+// version is the release identity, baked in at link time by CI (`-X main.version=v0.1.0`).
+// A plain `go build` leaves it "dev": the tag is the only thing that names a release, and
+// `punchd -version` is how a router answers "which one is running".
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		slog.Error("punchd exiting", "err", err)
@@ -33,8 +38,13 @@ func run() error {
 		dryRun     = flag.Bool("dry-run", false, "fetch the desired list, print the nft table and the status that would be posted; touch neither nft nor natmap")
 		interval   = flag.Duration("interval", 0, "override the reconcile interval (default: the config's `interval`, else 15s)")
 		logFormat  = flag.String("log-format", "text", "log format: text or json")
+		showVer    = flag.Bool("version", false, "print the build version and exit")
 	)
 	flag.Parse()
+	if *showVer {
+		fmt.Println(version)
+		return nil
+	}
 
 	var handler slog.Handler
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}

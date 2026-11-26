@@ -37,11 +37,15 @@ jobs:
       - name: build both binaries for linux/amd64 and linux/arm64
         run: |
           set -euo pipefail
+          # The tag IS the version (docs/adr/0001): on a `v*` tag both binaries carry it,
+          # anywhere else they say `dev`. Since no branch publishes anything, this is the
+          # one place a release identity enters a binary.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then VERSION="${GITHUB_REF_NAME}"; else VERSION=dev; fi
           mkdir -p bin
           for arch in amd64 arm64; do
             for cmd in punchd punch-controller; do
               CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
-                go build -trimpath -ldflags='-s -w' \
+                go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
                 -o "bin/${cmd}-linux-${arch}" "./cmd/${cmd}"
             done
           done
@@ -52,6 +56,22 @@ jobs:
           if go list -deps ./cmd/punchd | grep -q '^k8s.io/'; then
             echo "::error::punchd links a k8s.io package; it must stay a plain binary"
             exit 1
+          fi
+          # A release whose binary cannot answer `-version` is a release with no identity,
+          # and `-s -w` is exactly the flag that can silently strip one. On a tag the
+          # linker's answer is checked, not assumed: punchd by running it (the runner is
+          # amd64), the controller by looking for the string, since it refuses to run
+          # without a token and an apiserver.
+          if [ "$VERSION" != dev ]; then
+            got="$(bin/punchd-linux-amd64 -version)"
+            if [ "$got" != "$VERSION" ]; then
+              echo "::error::punchd -version says '$got', want '$VERSION'"
+              exit 1
+            fi
+            if ! grep -aqF -- "$VERSION" bin/punch-controller-linux-amd64; then
+              echo "::error::punch-controller-linux-amd64 does not carry '$VERSION'"
+              exit 1
+            fi
           fi
 
       - name: upload punchd (amd64)
@@ -71,11 +91,15 @@ jobs:
   image:
     name: build and push punch-controller
     needs: test
-    # Pull requests build nothing here: the registry credential is the workflow token, and
-    # a PR does not need a published tag. `main` and `v*` do.
+    # ONLY A TAG PUBLISHES. A branch push used to push `main` + `latest`, and that rolling
+    # tag is exactly the shape nothing can follow: home-ops' Renovate row can only track a
+    # `vX.Y.Z` tag, so a branch build was an identity with no version signal (the failure
+    # ADR-0017 named). Retired on purpose in docs/adr/0001. A pull request still builds
+    # nothing here: the registry credential is the workflow token, and an unmerged commit
+    # needs no identity.
     if: >-
       github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -99,11 +123,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/2017fighting/punch-controller
+          # No `type=ref,event=branch` and no `latest`: the tag is the version and the only
+          # thing consumers pin. `sha-<short>` stays as the content-addressed escape hatch
+          # for "show me the bytes this tag came from".
           tags: |
-            type=ref,event=branch
             type=ref,event=tag
             type=sha,prefix=sha-
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: build and push
         id: build
@@ -112,6 +137,10 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
+          # github.ref_name on a tag ref is `vX.Y.Z`; the Dockerfile bakes it into the
+          # binary with -X, so `docker logs` names the release the tag names.
+          build-args: |
+            VERSION=${{ github.ref_name }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
