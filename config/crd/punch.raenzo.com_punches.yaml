@@ -1,0 +1,215 @@
+# VENDORED COPY — DO NOT EDIT HERE. home-ops owns this file.
+#
+# The source of truth is `infrastructure/punch/00-crds.yaml` in 2017fighting/home-ops,
+# where it lands as the API contract before this repository exists (#351). This copy is
+# verbatim except for this header, and `api/v1alpha1/crd_test.go` parses it and fails
+# `go test ./...` the moment the Go types and the contract disagree — which is the
+# direction of the dependency: this repository is downstream of the CRD.
+#
+# When home-ops changes the CRD, re-copy it here with:
+#   git -C <home-ops> show <ref>:infrastructure/punch/00-crds.yaml >> config/crd/punch.raenzo.com_punches.yaml
+# (after restoring this header) and fix the types until `go test ./api/...` is green.
+---
+# The `Punch` CRD — HAND-WRITTEN, and that is the point (ADR-0044).
+#
+# WHY HAND-WRITTEN AND NOT VENDORED. Every other CRD in this repo is copied from
+# an upstream release (infrastructure/snapshot-controller/00-crds.yaml is the
+# precedent). This one has no upstream: the api types live in the controller's own
+# repository, which is not published yet and has no release to copy from (ticket
+# #354). So THIS FILE IS THE API CONTRACT, in the direction the dependency runs: the
+# controller repository is downstream of it. `controller-gen` run over that
+# repository's Go types must reproduce this document — a `make manifests` diff
+# against this file, empty, is the review gate on the Go side. When the two
+# disagree, this file wins until an ADR says otherwise, because this is the copy
+# the cluster has already accepted.
+#
+# (The apiserver, not any gate in this repo, is what validates it: kubeconform
+# reports a CRD as `skipped` — no schema is published for apiextensions.k8s.io —
+# so a malformed structural schema is caught at apply time, loudly, by the
+# cluster. Nothing offline can see it. That is also why the file is kept
+# deliberately plain: no CEL, no defaults beyond `protocol`.)
+#
+# WHERE THE CRs GO — and this is a structural rule, not a preference. One `Punch`
+# per app, in the app's OWN namespace (apps/qbittorrent-private/punch.yaml,
+# apps/hath/punch.yaml). A CRD and a custom resource must NEVER share a build
+# root: kustomize-controller server-side-dry-runs every object of a Kustomization
+# before applying any of them, so a `Punch` sitting beside this CRD fails the
+# dry-run, the CRD is therefore never applied, and a from-scratch bootstrap
+# deadlocks (the identical reasoning in
+# infrastructure/egress-gateway/egress-gateway-policy.yaml). The app rows carry
+# `deps: [punch]` so the CRD is established first; the pivot's retryInterval
+# covers the seconds between "Kustomization Ready" and "CRD Established".
+#
+# THE CONFIGMAP IS PART OF THIS CONTRACT, NAME AND KEY INCLUDED. For a `Punch` whose
+# `metadata.name` is `<name>`, the controller writes exactly one ConfigMap,
+# `<name>-punch`, in the Punch's OWN namespace, holding exactly one key,
+# `punch.json`, whose content is natmap's document `{ip, port, inner_port,
+# protocol}` (`inner_port` = the CR's `bindPort`, `port` = the Public Port).
+# Consumers read that KEY by name — #355's qBittorrent sidecar mounts the ConfigMap
+# and opens `/punch/punch.json` — so a controller that writes another name or
+# another key is WRONG, not merely different.
+#
+# WHAT CATCHES A WRONG KEY, AND WHAT DOES NOT — stated plainly, because an earlier
+# version of this paragraph claimed a protection the code does not deliver. A
+# controller writing another KEY leaves the mount EMPTY: there is no file, so
+# `qbt_punch_file_present` stays 0 and `QbtPunchNotApplied` cannot fire at all — its
+# premise is a VISIBLE file (`file_present == 1`). Two surfaces remain, and neither is
+# an alert on the first bad write: the sidecar logs ONE WARN per change, naming the key
+# it expected and the keys it found (`announce.py`, `note_absent_punch_dir`), and
+# `QbtPunchFileGone` fires only on the INVERSE shape (a file that was there and then
+# went away). So the first wrong key is a log line: grep the `announce` container for
+# `ConfigMap key must be` after a controller change. That is the gap — named here
+# rather than papered over, because a contract that overstates its own protection is
+# worse than one that admits it.
+#
+# DELETING THIS FILE IS DATA-DESTROYING. The `punch` Kustomization prunes, so a
+# CRD dropped from the root is deleted — and deleting a CRD deletes every custom
+# resource of it, i.e. every app's punch declaration at once. Retire the feature,
+# never the file.
+#
+# Status is a SUBRESOURCE (`punches/status` below), because ADR-0044 gives the
+# controller ownership of `status` alone — the spec belongs to whoever declared
+# the punch, and #351's RBAC grants exactly that split.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: punches.punch.raenzo.com
+spec:
+  group: punch.raenzo.com
+  names:
+    kind: Punch
+    listKind: PunchList
+    plural: punches
+    singular: punch
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      # `kubectl get punches -A` answers the ticket's acceptance question — which
+      # public port is this punch on right now — without an -o yaml. Port is the
+      # LAN-side port we chose (the number the redirect matches); Public is the
+      # carrier's, which is only ever an announcement (ADR-0044 fact 1/fact 2).
+      additionalPrinterColumns:
+        - jsonPath: .spec.bindPort
+          name: Port
+          type: integer
+          description: The LAN-side port the router binds and redirects (spec.bindPort).
+        - jsonPath: .status.state
+          name: State
+          type: string
+          description: pending | up | down, as last stamped by the controller.
+        - jsonPath: .status.publicPort
+          name: Public
+          type: integer
+          description: The carrier-assigned public port, as last reported by the agent.
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: |-
+            Punch declares one inbound port that must reach this cluster through the
+            carrier's CGNAT: the router keeps a STUN-discovered mapping alive and
+            health-reports it, the controller turns the reports into status and into a
+            `<name>-punch` ConfigMap beside the CR. ADR-0044 is the design.
+          required:
+            - spec
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              description: The declaration — owned by the app's manifest, never by the controller.
+              required:
+                - target
+                - bindPort
+              properties:
+                target:
+                  type: string
+                  minLength: 1
+                  # IPv4/host + port, nothing else: not a URL and not a scheme. Both
+                  # planned targets are LAN literals (192.168.x.y:port), and the agent
+                  # renders this straight into the nft DNAT destination (ADR-0044).
+                  pattern: "^[A-Za-z0-9.-]+:[0-9]{1,5}$"
+                  description: |-
+                    Where the router forwards to, as `host:port` on the LAN — the INNER side
+                    of the punch (e.g. `192.168.9.239:5201`). The outer side is `bindPort`.
+                protocol:
+                  type: string
+                  enum:
+                    - TCP
+                  default: TCP
+                  description: |-
+                    Transport. TCP is the only legal value and the only value that has ever
+                    been used: the carrier maps TCP and UDP independently, so a UDP punch
+                    would produce a second public port no announce can express (ADR-0044).
+                bindPort:
+                  type: integer
+                  format: int32
+                  minimum: 1
+                  maximum: 65535
+                  description: |-
+                    The LAN-side port the router binds (natmap's inner port) and the number the
+                    DNAT rule matches. This is the ONE copy of the port: it was duplicated
+                    between the router's UCI and each app's poller before ADR-0044. Must be
+                    unique cluster-wide — there is no admission webhook, so the controller
+                    validates it and reports Down(reason=bindPortConflict) instead of choosing
+                    another port (ADR-0044, Consequences).
+            status:
+              type: object
+              description: Written by the controller only (the `punches/status` subresource).
+              properties:
+                state:
+                  type: string
+                  enum:
+                    - pending
+                    - up
+                    - down
+                  description: |-
+                    `pending` — desired and never mapped yet; `up` — the agent reports a live
+                    mapping; `down` — the agent reports its natmap dead, the agent has been
+                    silent past the deadline, or the declaration is invalid (see `reason`).
+                publicIP:
+                  type: string
+                  description: The carrier's public address for this mapping, as last reported.
+                publicPort:
+                  type: integer
+                  format: int32
+                  minimum: 1
+                  maximum: 65535
+                  description: |-
+                    The carrier-assigned public port. The carrier does not preserve ports, so
+                    this is an announcement, never a number anything may key on (ADR-0044 fact 2).
+                innerPort:
+                  type: integer
+                  format: int32
+                  minimum: 1
+                  maximum: 65535
+                  description: >-
+                    The CR's `bindPort`, echoed back — the port the redirect matches (CONTEXT.md, Bind Port).
+                reason:
+                  type: string
+                  description: |-
+                    A short machine-readable cause, set while `state` is not `up` — e.g.
+                    `noHeartbeat`, `agentDown`, `bindPortConflict`. Free-form so the controller
+                    can add one without a CRD change; the alerts do not parse it.
+                lastSeenAt:
+                  type: string
+                  format: date-time
+                  description: |-
+                    When the controller last received a status report for this punch, stamped with
+                    the CLUSTER's clock — never the router's. Liveness is a deadline against this
+                    field (now - lastSeenAt > 60s => down), because natmap is edge-triggered and
+                    publishes no heartbeat of its own (ADR-0044 fact 4).
+                observedGeneration:
+                  type: integer
+                  format: int64
+                  description: The `metadata.generation` the rest of this status was computed from.
