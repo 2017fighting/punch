@@ -197,6 +197,18 @@ table ip punch {
 
 That `-dry-run` is also how the redirect is reviewed: the file it prints is the file the agent writes.
 
+### A dead natmap is restarted, and the report goes with it
+
+`natmap` has no heartbeat (ADR-0044 fact 4), so a child that exits is invisible until someone
+looks. The agent owns that: on the tick that sees `Exited`, it drops the entry, **deletes the
+dead child's `<bindPort>.args` report** (the replacement writes a new one only when it has a
+mapping — keeping the old file would announce the dead child's public port), and starts a fresh
+child. The wait before each attempt doubles from `RestartInitialDelay` (15 s) to
+`RestartMaxDelay` (5 min), and a child that lived past `RestartHealthyFor` (2 min) resets it, so
+one crash every few hours is retried at once while a crash loop is spaced out instead of becoming
+a restart storm on a 15 s tick. Between the death and the replacement's first report the punch is
+`pending` — "nothing announced yet" — which is the honest state, and the ConfigMap says so.
+
 ### The redirect, and the three traps
 
 One self-owned `table ip punch`, rendered into fw4's auto-include at `priority dstnat - 5`:

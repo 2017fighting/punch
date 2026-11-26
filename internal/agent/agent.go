@@ -94,6 +94,35 @@ type Agent struct {
 	renderedOnce bool
 	// redirectErr is the last apply/read-back failure, reported per punch.
 	redirectErr error
+	// restarts is the per-bindPort memory that keeps a natmap which keeps dying from
+	// becoming a restart storm.
+	restarts map[int32]*restartState
+}
+
+// Restart bounds for a natmap child that exited. The agent restarts it because nothing
+// else ever would: natmap publishes no heartbeat and the runner used to keep the dead
+// entry in its map forever, so the punch reported `down` until punchd itself restarted
+// (measured 2026-11-26 — a killed natmap left the punch down for minutes).
+const (
+	// RestartInitialDelay is the first wait after a death; the agent ticks every 15s, so
+	// this is one tick.
+	RestartInitialDelay = 15 * time.Second
+	// RestartMaxDelay caps the doubling, so a permanently broken natmap is retried every
+	// five minutes rather than never.
+	RestartMaxDelay = 5 * time.Minute
+	// RestartHealthyFor is how long a child must have lived for its death to count as a
+	// fresh failure instead of a crash loop. A child that ran this long resets the backoff.
+	RestartHealthyFor = 2 * time.Minute
+)
+
+// restartState is one bindPort's restart memory.
+type restartState struct {
+	// startedAt is when the current child was launched (zero: this process did not launch
+	// it, so the backoff is not ours to judge).
+	startedAt time.Time
+	// notBefore is the earliest next attempt; delay is the wait that produced it.
+	notBefore time.Time
+	delay     time.Duration
 }
 
 // New builds an agent. It performs no I/O.
@@ -361,8 +390,30 @@ func (a *Agent) reconcileNatmaps(desired []Desired) map[int32]error {
 	want := map[int32]bool{}
 	for _, d := range desired {
 		want[d.BindPort] = true
-		if _, ok := running[d.BindPort]; ok {
-			continue
+		if c, ok := running[d.BindPort]; ok {
+			if !c.Exited {
+				continue
+			}
+			// The child is gone, and nothing else will bring it back: forget the entry and
+			// start a fresh natmap, or the punch reports "natmap exited" until punchd is
+			// restarted by hand.
+			if wait, reason := a.restartWait(d.BindPort, c); wait > 0 {
+				childErrs[d.BindPort] = fmt.Errorf("natmap exited (%s); retrying in %s", reason, wait.Round(time.Second))
+				continue
+			}
+			if err := a.natmap.Stop(d.BindPort); err != nil {
+				a.log.Error("cannot clear exited natmap", "namespace", d.Namespace, "punch", d.Name, "bindPort", d.BindPort, "err", err)
+				childErrs[d.BindPort] = err
+				continue
+			}
+			// The report belongs to the child that died: natmap's `-e` script is
+			// edge-triggered, so the replacement writes a new one only when it has a
+			// mapping. Keeping the old file would announce the dead child's public port.
+			if err := os.Remove(ReportPath(a.cfg.StateDir, d.BindPort)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				a.log.Warn("cannot clear the dead natmap's report", "bindPort", d.BindPort, "err", err)
+			}
+			a.log.Warn("natmap exited; restarting", "namespace", d.Namespace, "punch", d.Name,
+				"bindPort", d.BindPort, "err", c.Err)
 		}
 		argv := natmapArgs(a.cfg, d.BindPort)
 		if err := a.natmap.Start(d.BindPort, argv); err != nil {
@@ -370,6 +421,7 @@ func (a *Agent) reconcileNatmaps(desired []Desired) map[int32]error {
 			childErrs[d.BindPort] = err
 			continue
 		}
+		a.noteStarted(d.BindPort)
 		a.log.Info("started natmap for punch", "namespace", d.Namespace, "punch", d.Name, "bindPort", d.BindPort)
 	}
 	ports := make([]int32, 0, len(running))
@@ -497,6 +549,58 @@ func (a *Agent) snapshot(unreachableReason string, invalid map[string]string, st
 func childExists(children map[int32]ChildState, port int32) bool {
 	_, ok := children[port]
 	return ok
+}
+
+// noteStarted records that this process launched the child for port, which is what lets
+// restartWait tell a crash loop from an occasional crash.
+func (a *Agent) noteStarted(port int32) {
+	st := a.restartState(port)
+	st.startedAt = a.now()
+}
+
+// restartWait decides whether an exited child may be restarted now, returning how long to
+// wait when it may not, and why it exited. The wait doubles per death up to
+// RestartMaxDelay, and a child that lived past RestartHealthyFor resets it — so one crash
+// every few hours is retried at once, while a crash loop is spaced out instead of becoming
+// a restart storm on a 15s tick.
+func (a *Agent) restartWait(port int32, child ChildState) (time.Duration, string) {
+	reason := child.Err
+	if reason == "" {
+		reason = "exited"
+	}
+	st := a.restartState(port)
+	now := a.now()
+	if !st.startedAt.IsZero() && now.Sub(st.startedAt) >= RestartHealthyFor {
+		st.delay, st.notBefore = 0, time.Time{}
+	}
+	if now.Before(st.notBefore) {
+		return st.notBefore.Sub(now), reason
+	}
+	// Allowed now. The attempt is recorded before it happens, so this death also decides
+	// how long the NEXT one waits.
+	st.delay = nextRestartDelay(st.delay)
+	st.notBefore = now.Add(st.delay)
+	return 0, reason
+}
+
+// nextRestartDelay doubles the wait, bounded.
+func nextRestartDelay(d time.Duration) time.Duration {
+	if d <= 0 {
+		return RestartInitialDelay
+	}
+	return min(d*2, RestartMaxDelay)
+}
+
+func (a *Agent) restartState(port int32) *restartState {
+	if a.restarts == nil {
+		a.restarts = map[int32]*restartState{}
+	}
+	st, ok := a.restarts[port]
+	if !ok {
+		st = &restartState{}
+		a.restarts[port] = st
+	}
+	return st
 }
 
 func ports(r NatmapRunner) []int32 {

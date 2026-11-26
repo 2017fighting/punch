@@ -387,7 +387,12 @@ func TestTickReportsPendingBeforeAnyMapping(t *testing.T) {
 	}
 }
 
-func TestTickReportsDownWhenNatmapExits(t *testing.T) {
+// TestTickRestartsNatmapAfterExit: a natmap that exits is replaced by the agent, because
+// nothing else ever would — natmap publishes no heartbeat, and the runner kept the dead
+// entry in its map, so the punch reported "natmap exited" until punchd itself restarted
+// (measured 2026-11-26: a killed natmap left the punch down for minutes until punchd was
+// restarted by hand).
+func TestTickRestartsNatmapAfterExit(t *testing.T) {
 	cl := newFakeCluster(t, qbPunch())
 	cfg := testConfig(t, cl)
 	nat := newFakeNatmap()
@@ -396,15 +401,82 @@ func TestTickReportsDownWhenNatmapExits(t *testing.T) {
 	if err := a.Tick(t.Context()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
+	if len(nat.starts) != 1 {
+		t.Fatalf("starts = %d, want the one child", len(nat.starts))
+	}
 	writeReport(t, cfg.StateDir, 27257, "120.244.157.23", 38698)
 	nat.set(27257, ChildState{Exited: true, Err: "exit status 1"})
 
 	if err := a.Tick(t.Context()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
+	if len(nat.stops) != 1 || nat.stops[0] != 27257 {
+		t.Errorf("stops = %v, want the dead child cleared before it is replaced", nat.stops)
+	}
+	if len(nat.starts) != 2 {
+		t.Fatalf("starts = %d, want the dead child replaced", len(nat.starts))
+	}
+	// The dead child's report was cleared, so the punch is "nothing announced yet" rather
+	// than re-announcing the dead child's public port.
+	if p := cl.lastPost(t).Punches[0]; p.State != StatePending {
+		t.Errorf("report = %+v, want pending until the replacement reports", p)
+	}
+
+	// The replacement announces its own mapping — possibly a different public port, which
+	// is exactly why the old report could not be kept.
+	writeReport(t, cfg.StateDir, 27257, "120.244.157.23", 40000)
+	if err := a.Tick(t.Context()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
 	p := cl.lastPost(t).Punches[0]
-	if p.State != StateDown || !strings.Contains(p.Reason, "natmap exited") {
-		t.Errorf("report = %+v, want down with the child's exit", p)
+	if p.State != StateUp || p.PublicPort != 40000 {
+		t.Errorf("report = %+v, want up on the replacement's port", p)
+	}
+}
+
+// TestRestartBackoffSpacesOutACrashLoop: a natmap that dies on start must not be restarted
+// on every tick. The wait doubles from RestartInitialDelay, so a natmap that is simply
+// broken is retried every RestartMaxDelay instead of 5 760 times a day.
+func TestRestartBackoffSpacesOutACrashLoop(t *testing.T) {
+	cl := newFakeCluster(t, qbPunch())
+	cfg := testConfig(t, cl)
+	nat := newFakeNatmap()
+	a := newTestAgent(t, cfg, nat, &fakeNft{dumpBytes: []byte(nftDumpOne)})
+	now := time.Date(2026, 11, 26, 10, 0, 0, 0, time.UTC)
+	a.now = func() time.Time { return now }
+
+	if err := a.Tick(t.Context()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(nat.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(nat.starts))
+	}
+
+	// Each death at a controlled moment: the first is replaced at once (the child ran for
+	// an unknown time), and after that the waits are 15s, then 30s.
+	steps := []struct {
+		advance    time.Duration
+		wantStarts int
+		wantReason string
+	}{
+		{0, 2, ""},
+		{5 * time.Second, 2, "retrying in"},
+		{10 * time.Second, 3, ""},
+	}
+	for i, st := range steps {
+		now = now.Add(st.advance)
+		nat.set(27257, ChildState{Exited: true, Err: "exit status 1"})
+		if err := a.Tick(t.Context()); err != nil {
+			t.Fatalf("step %d: Tick: %v", i, err)
+		}
+		if got := len(nat.starts); got != st.wantStarts {
+			t.Fatalf("step %d: starts = %d, want %d (backoff)", i, got, st.wantStarts)
+		}
+		if st.wantReason != "" {
+			if p := cl.lastPost(t).Punches[0]; !strings.Contains(p.Reason, st.wantReason) {
+				t.Errorf("step %d: reason = %q, want it to say %q", i, p.Reason, st.wantReason)
+			}
+		}
 	}
 }
 
