@@ -40,14 +40,24 @@
 # `deps: [punch]` so the CRD is established first; the pivot's retryInterval
 # covers the seconds between "Kustomization Ready" and "CRD Established".
 #
-# THE CONFIGMAP IS PART OF THIS CONTRACT, NAME AND KEY INCLUDED. For a `Punch` whose
-# `metadata.name` is `<name>`, the controller writes exactly one ConfigMap,
+# THE CONFIGMAP IS PART OF THIS CONTRACT, NAME, KEY AND CONTENT INCLUDED. For a `Punch`
+# whose `metadata.name` is `<name>`, the controller writes exactly one ConfigMap,
 # `<name>-punch`, in the Punch's OWN namespace, holding exactly one key,
 # `punch.json`, whose content is natmap's document `{ip, port, inner_port,
 # protocol}` (`inner_port` = the CR's `bindPort`, `port` = the Public Port).
 # Consumers read that KEY by name — #355's qBittorrent sidecar mounts the ConfigMap
 # and opens `/punch/punch.json` — so a controller that writes another name or
 # another key is WRONG, not merely different.
+#
+# A PUNCH THAT IS NOT UP SAYS SO IN THAT KEY, and the object is NOT deleted:
+# `{"ip":"","port":0,...}`. The original rule was "`down` deletes the ConfigMap, so
+# the next start is blocked", and the second half of it was wrong — kubelet never
+# removes a deleted ConfigMap's files from a running pod's volume, so the file keeps
+# its last payload and an app cannot tell `down` from `up` (measured 2026-11-26: the
+# file was byte-identical 2.5 minutes after the object was gone, with only
+# `MountVolume.SetUp failed ... not found` in the pod's events). An UPDATE is
+# projected to the mount in ~60-90s, so the document is what carries the state, and
+# a consumer must read its content rather than test for the file.
 #
 # WHAT CATCHES A WRONG KEY, AND WHAT DOES NOT — stated plainly, because an earlier
 # version of this paragraph claimed a protection the code does not deliver. A

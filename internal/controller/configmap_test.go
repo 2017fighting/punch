@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -82,6 +83,46 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 	if _, err := BuildConfigMap(p, "120.244.157.23", 0); err == nil {
 		t.Error("BuildConfigMap with port 0 = nil error, want refusal")
+	}
+}
+
+// TestBuildDownConfigMap: the "not up" object differs from the "up" one in exactly one
+// place — the document — because everything else about it is the contract (name, key,
+// labels, ownerReference), and a consumer must be able to open it by name either way.
+func TestBuildDownConfigMap(t *testing.T) {
+	p := testPunch("hath", "apps-hath", "192.168.9.71:44388", 44388)
+	cm, err := BuildDownConfigMap(p)
+	if err != nil {
+		t.Fatalf("BuildDownConfigMap: %v", err)
+	}
+	up, err := BuildConfigMap(p, "120.244.157.23", 38697)
+	if err != nil {
+		t.Fatalf("BuildConfigMap: %v", err)
+	}
+	if cm.GetName() != up.GetName() || cm.GetNamespace() != up.GetNamespace() {
+		t.Errorf("down object = %s/%s, up object = %s/%s: the name must not depend on state",
+			cm.GetNamespace(), cm.GetName(), up.GetNamespace(), up.GetName())
+	}
+
+	doc, found, err := unstructuredString(cm.Object, "data", v1alpha1.ConfigMapKey)
+	if err != nil || !found {
+		t.Fatalf("data[%s] missing: found=%v err=%v", v1alpha1.ConfigMapKey, found, err)
+	}
+	want := `{"ip":"","port":0,"inner_port":44388,"protocol":"tcp"}`
+	if doc != want {
+		t.Errorf("punch.json = %s, want %s", doc, want)
+	}
+	if !saysDown(t, doc) {
+		t.Error("the down document must read as no public tuple")
+	}
+	// The rest of the object is the up shape's: same labels, same single ownerRef.
+	if !reflect.DeepEqual(cm.GetLabels(), up.GetLabels()) {
+		t.Errorf("labels = %v, want %v", cm.GetLabels(), up.GetLabels())
+	}
+	downRefs, _, _ := unstructuredSlice(cm.Object, "metadata", "ownerReferences")
+	upRefs, _, _ := unstructuredSlice(up.Object, "metadata", "ownerReferences")
+	if !reflect.DeepEqual(downRefs, upRefs) {
+		t.Errorf("ownerReferences = %v, want %v", downRefs, upRefs)
 	}
 }
 

@@ -215,19 +215,31 @@ func (c *Controller) writeConfigMap(ctx context.Context, punchName, namespace st
 	return nil
 }
 
-func (c *Controller) deleteConfigMap(ctx context.Context, punchName, namespace string) error {
-	name, err := ConfigMapNameFor(punchName)
+// writeConfigMapIfChanged writes cm unless the live object already carries the same
+// document. The resync runs every 15s and the status endpoint hears from the agent every
+// 15s, so an unconditional write would be a write loop over an object whose whole purpose
+// is its content — and content is what the mounts project, so that is what decides.
+func (c *Controller) writeConfigMapIfChanged(ctx context.Context, punchName, namespace string, cm *unstructured.Unstructured) error {
+	existing, err := c.dyn.Resource(configMapGVR).Namespace(namespace).Get(ctx, cm.GetName(), metav1.GetOptions{})
+	switch {
+	case err != nil && !isNotFound(err):
+		return fmt.Errorf("get configmap %s/%s: %w", namespace, cm.GetName(), err)
+	case err == nil && PunchDocOf(existing) == PunchDocOf(cm):
+		return nil
+	}
+	return c.writeConfigMap(ctx, punchName, namespace, cm)
+}
+
+// writeDownState makes the punch's document say "not up": `down` and `pending` both mean
+// "nothing is mapped", and both are SAID rather than implied by absence, because a deleted
+// ConfigMap is invisible to a running pod (see BuildDownConfigMap). Idempotent, so the
+// resync and every repeated report are free.
+func (c *Controller) writeDownState(ctx context.Context, p *v1alpha1.Punch) error {
+	cm, err := BuildDownConfigMap(p)
 	if err != nil {
 		return err
 	}
-	err = c.dyn.Resource(configMapGVR).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	if err != nil && !isNotFound(err) {
-		return fmt.Errorf("delete configmap %s/%s: %w", namespace, name, err)
-	}
-	if err == nil {
-		c.log.Info("deleted punch configmap (the punch is down)", "namespace", namespace, "punch", punchName, "configmap", name)
-	}
-	return nil
+	return c.writeConfigMapIfChanged(ctx, p.Name, p.Namespace, cm)
 }
 
 // --- HTTP handlers ----------------------------------------------------------------
@@ -297,7 +309,8 @@ type statusResponse struct {
 
 // handleStatus accepts the agent's full snapshot: one entry per punch per tick. The
 // controller stamps `lastSeenAt` from ITS clock (never the agent's), patches the
-// `/status` subresource, and writes or deletes the `<name>-punch` ConfigMap.
+// `/status` subresource, and writes the `<name>-punch` ConfigMap (its document says
+// whether the punch is up).
 func (c *Controller) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -382,12 +395,15 @@ func (c *Controller) handleStatus(w http.ResponseWriter, r *http.Request) {
 				c.log.Error("status: cannot build configmap", "namespace", p.Namespace, "punch", p.Name, "err", err)
 				break
 			}
-			if err := c.writeConfigMap(ctx, p.Name, p.Namespace, cm); err != nil {
+			if err := c.writeConfigMapIfChanged(ctx, p.Name, p.Namespace, cm); err != nil {
 				c.log.Error("status: configmap write failed", "namespace", p.Namespace, "punch", p.Name, "err", err)
 			}
-		case v1alpha1.StateDown:
-			if err := c.deleteConfigMap(ctx, p.Name, p.Namespace); err != nil {
-				c.log.Error("status: configmap delete failed", "namespace", p.Namespace, "punch", p.Name, "err", err)
+		case v1alpha1.StatePending, v1alpha1.StateDown:
+			// Both mean "nothing is mapped", and the app learns that from the document:
+			// a deleted ConfigMap would leave the last payload in every running pod's
+			// volume and say nothing at all.
+			if err := c.writeDownState(ctx, p); err != nil {
+				c.log.Error("status: down-document write failed", "namespace", p.Namespace, "punch", p.Name, "err", err)
 			}
 		}
 		c.log.Info("status: applied",
@@ -461,15 +477,15 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 		}
 
 		switch r.State {
-		case v1alpha1.StateDown:
-			// Only `down` deletes: an absent file must mean "the punch is not up", and a
-			// sticky mount in a running pod still sees the deletion on its next read.
-			if err := c.deleteConfigMap(ctx, r.Name, r.Namespace); err != nil {
-				c.log.Error("reconcile: configmap delete failed", "namespace", r.Namespace, "punch", r.Name, "err", err)
+		case v1alpha1.StateDown, v1alpha1.StatePending:
+			// Both mean "nothing is mapped", and the document is the only way to say it:
+			// a punch that has never been up gets its (down) document too, so an app's
+			// start no longer depends on a ConfigMap appearing later.
+			if err := c.writeDownState(ctx, p); err != nil {
+				c.log.Error("reconcile: down-document write failed", "namespace", r.Namespace, "punch", r.Name, "err", err)
 			}
 		case v1alpha1.StateUp:
-			// Keep it when up: recreate if someone removed it by hand, so the app's file
-			// stays the truth rather than staying silently empty.
+			// Repair as well as recreate: a hand-edited document is not the punch's.
 			if r.PublicIP == "" || r.PublicPort <= 0 {
 				continue
 			}
@@ -477,10 +493,8 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 			if err != nil {
 				continue
 			}
-			if _, err := c.dyn.Resource(configMapGVR).Namespace(r.Namespace).Get(ctx, cm.GetName(), metav1.GetOptions{}); apierrors.IsNotFound(err) {
-				if err := c.writeConfigMap(ctx, r.Name, r.Namespace, cm); err != nil {
-					c.log.Error("reconcile: configmap recreate failed", "namespace", r.Namespace, "punch", r.Name, "err", err)
-				}
+			if err := c.writeConfigMapIfChanged(ctx, r.Name, r.Namespace, cm); err != nil {
+				c.log.Error("reconcile: configmap write failed", "namespace", r.Namespace, "punch", r.Name, "err", err)
 			}
 		}
 	}
