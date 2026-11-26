@@ -162,6 +162,7 @@ interval    = 15s         # optional
 | `-dry-run` | fetch the desired list, print the nft table and the status that would be posted; touch neither `nft` nor `natmap`, post nothing |
 | `-interval` | override the config's interval |
 | `-log-format` | `text` or `json` |
+| `-version` | print the build's version (the release tag; `dev` outside a tagged CI build) and exit |
 
 First manual run, before anything is installed:
 
@@ -261,9 +262,31 @@ docker build -t punch-controller .
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/punchd ./cmd/punchd
 ```
 
-CI (`.github/workflows/ci.yml`) runs `go vet`, `go test`, builds **both binaries for linux/amd64 and
-linux/arm64**, uploads `punchd` as the workflow artifacts `punchd-linux-amd64` / `punchd-linux-arm64`, and
-— on `main` and `v*` tags — pushes `ghcr.io/2017fighting/punch-controller` with `GITHUB_TOKEN`.
+CI (`.github/workflows/ci.yml`) runs `go vet`, `go test` and builds **both binaries for linux/amd64 and
+linux/arm64** on every branch and PR, but **only a `v*` tag publishes**: it uploads `punchd` as the
+workflow artifacts `punchd-linux-amd64` / `punchd-linux-arm64` and pushes
+`ghcr.io/2017fighting/punch-controller` with `GITHUB_TOKEN`, under the tag `vX.Y.Z` (plus
+`sha-<short>`). No branch tag, no `latest` — a rolling tag is an identity nothing can follow.
+
+### Release
+
+The tag is the release identity (`docs/adr/0001-release-identity.md`): one repository-wide `vX.Y.Z` for
+the module, so both binaries move together.
+
+```bash
+# the release commit is whatever main is when you decide to ship it
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+That push is the whole ritual. It builds with `-X main.version=v0.1.0`, publishes
+`ghcr.io/2017fighting/punch-controller:v0.1.0`, and fails loudly if `-s -w` ever stops the binary from
+answering `punchd -version` (the workflow runs it on the tag). Consumers pin the tag itself:
+`home-ops` pins the image tag (`:v0.1.0`, Renovate-tracked), and the OpenWrt feed pins the tag's commit
+and keeps a date as `PKG_VERSION` because `apk` orders by it only. **Nothing consumes a branch.**
+
+A tag is never moved or re-pushed over: `apk` and the registry both treat the tag as identity, so a bad
+`v0.1.0` is retracted by shipping `v0.1.1`, not by rewriting history.
 
 What the tests cover: the CRD/Go parity gate; the state machine (pending/up/down, the deadline boundary,
 `bindPortConflict`, deterministic order); the metrics text (exact contract lines, one-hot cardinality, no
@@ -274,3 +297,7 @@ against a fake apiserver (status patch, `lastSeenAt` from the controller's clock
 ConfigMap kept when `up` and recreated when missing); the agent (config parsing, notify script and report
 parsing, exact `natmap` argv, renderer output, read-back verification of all three traps, fetch-failure
 behaviour, idempotent ticks, `-dry-run` touching nothing, the `auto_includes` assertion).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

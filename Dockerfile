@@ -11,8 +11,12 @@ RUN go mod download
 
 COPY . .
 ARG TARGETOS TARGETARCH
+# The release identity. CI passes github.ref_name (the `vX.Y.Z` tag) and nothing else
+# publishes an image, so this is the only value it ever gets in the registry; the default
+# is what a local `docker build` gets. Baked in with -X: the process logs it at startup.
+ARG VERSION=dev
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags='-s -w' -o /out/punch-controller ./cmd/punch-controller
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/punch-controller ./cmd/punch-controller
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
