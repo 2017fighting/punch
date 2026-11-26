@@ -189,3 +189,24 @@ func TestWriteIncludeIsAtomic(t *testing.T) {
 		t.Error("the temporary file was left behind")
 	}
 }
+
+// The include directory does not exist on a device that has never had a punch (fw4 only
+// reads it), so the first tick must create it — observed live on 2026-11-26: without
+// this, every tick failed with ENOENT and no redirect was ever installed.
+func TestWriteIncludeCreatesMissingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nftables.d", "ruleset-post", "punch.nft")
+	if err := WriteInclude(path, "destroy table ip punch\n"); err != nil {
+		t.Fatalf("WriteInclude into a missing directory: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "destroy table ip punch\n" {
+		t.Fatalf("content = %q", got)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("the temp file must be renamed away, stat err = %v", err)
+	}
+}

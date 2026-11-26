@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -329,6 +330,13 @@ func (n *NftExec) DeleteTable(ctx context.Context) error {
 // BEFORE applying it: a concurrent `fw4 reload` re-reads this file, so it must already
 // hold the new rules or it would re-apply the old ones (research note §6, "先写文件，再 nft -f").
 func WriteInclude(path, content string) error {
+	// The include's directory is not guaranteed to exist on a default image: fw4 only
+	// reads it, and the first boot of a device that has never had a punch has no
+	// /usr/share/nftables.d/ruleset-post at all (observed on the first live run,
+	// 2026-11-26 — the first tick failed with ENOENT). Creating it is the agent's job.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create include dir for %s: %w", path, err)
+	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", tmp, err)
