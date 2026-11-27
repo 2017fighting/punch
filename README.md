@@ -209,6 +209,33 @@ one crash every few hours is retried at once while a crash loop is spaced out in
 a restart storm on a 15 s tick. Between the death and the replacement's first report the punch is
 `pending` — "nothing announced yet" — which is the honest state, and the ConfigMap says so.
 
+### A restart stops its children (and a SIGKILLed one is swept)
+
+The natmap children are punchd's, and procd supervises only punchd. So on `ctx.Done()` — the
+SIGTERM behind `service restart` and `apk upgrade` — the agent SIGTERMs every child's process
+group, **waits for each to exit**, and deletes the report it left. The wait is the point: the
+bind port is free when the process is gone, not when the signal was sent. Without it every
+restart left the old generation's children behind holding `27257`/`27258`, and the new one
+could not map at all — `[E] sock_connect src/hev-sock.c:60 Cannot assign requested address`,
+while the punch still reported `up` off the orphan's report (issue #2, measured 2026-11-26).
+The old report goes with the child it described, so the restart says `pending` — "nothing
+announced yet" — instead of re-announcing a public port nothing owns. That is one rule, applied
+at all three places a child stops: the shutdown above, the restart after a crash, and a punch
+that is no longer desired.
+
+A punchd that was SIGKILLed never runs that path (a `kill -9`, or procd's term timeout on a
+punchd stuck in a tick). The next one therefore sweeps on startup, before its first tick: it
+looks for `natmap` processes whose `-e` script is **its own notify path**, and SIGTERMs, then
+SIGKILLs, each one — and deletes the report of every child it killed. The command line is the
+marker because the router also runs unrelated natmap instances (their own `-e`, their own `-f
+<fwmark>`), and killing every `/usr/bin/natmap` would take those down with it — the one thing
+an init script's `stop_service` cannot decide.
+
+Measured on the router (x86_64, ImmortalWrt 25.12.1) upgrading v0.2.1 to this: the old
+generation's two children were swept 40.560 s into the restart, the replacements bound at
+40.632 s, and the first tick reported `pending=2` / the next `up=2`. A clean restart stops both
+children in 1 ms, and a `kill -9` is cleaned up by procd's respawn plus the same sweep.
+
 ### The redirect, and the three traps
 
 One self-owned `table ip punch`, rendered into fw4's auto-include at `priority dstnat - 5`:
@@ -324,7 +351,10 @@ against a fake apiserver (status patch, `lastSeenAt` from the controller's clock
 `up` / deleted on `down`, batch validation, unknown punches); the reconcile loop (deadline, pending,
 ConfigMap kept when `up` and recreated when missing); the agent (config parsing, notify script and report
 parsing, exact `natmap` argv, renderer output, read-back verification of all three traps, fetch-failure
-behaviour, idempotent ticks, `-dry-run` touching nothing, the `auto_includes` assertion).
+behaviour, idempotent ticks, `-dry-run` touching nothing, the `auto_includes` assertion, a natmap that
+exits being replaced with a backoff, the shutdown that stops every child, waits for it and clears its
+report, the SIGKILL escalation, and the startup sweep that kills a SIGKILLed generation's natmaps and
+nobody else's).
 
 ## License
 

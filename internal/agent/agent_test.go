@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -46,6 +47,21 @@ func (f *fakeNatmap) Stop(port int32) error {
 	defer f.mu.Unlock()
 	f.stops = append(f.stops, port)
 	delete(f.children, port)
+	return nil
+}
+
+func (f *fakeNatmap) StopAll() error {
+	f.mu.Lock()
+	ports := make([]int32, 0, len(f.children))
+	for port := range f.children {
+		ports = append(ports, port)
+	}
+	f.mu.Unlock()
+	for _, port := range ports {
+		if err := f.Stop(port); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -191,6 +207,18 @@ func qbPunch() Desired {
 		Target: "192.168.9.70:6881", Protocol: "TCP", BindPort: 27257}
 }
 
+// hathPunch is the second punch the issue's device carried: two natmap children, and a
+// restart left both of them behind holding their ports.
+func hathPunch() Desired {
+	return Desired{Name: "hath", Namespace: "apps-hath",
+		Target: "192.168.9.70:30001", Protocol: "TCP", BindPort: 27258}
+}
+
+var nftDumpTwo = nftJSONDump(
+	nftJSONRule(2, 27257, "192.168.9.70", 6881),
+	nftJSONRule(3, 27258, "192.168.9.70", 30001),
+)
+
 func newTestAgent(t *testing.T, cfg Config, nat *fakeNatmap, nft *fakeNft) *Agent {
 	t.Helper()
 	a, err := New(cfg, Deps{Natmap: nat, Nft: nft, Log: slog.New(slog.NewTextHandler(os.Stderr,
@@ -252,6 +280,98 @@ func TestTickStartsNatmapAppliesAndReportsUp(t *testing.T) {
 	}
 	if p.Reason != "" {
 		t.Errorf("reason = %q, want empty", p.Reason)
+	}
+}
+
+// TestRunStopsEveryChildOnCancel is issue #2's test, in the issue's own shape: two children
+// running, the context cancelled (what procd's SIGTERM does), and both children stopped and
+// waited for before Run returns. A restart that left them behind is a restart whose next
+// generation cannot bind.
+func TestRunStopsEveryChildOnCancel(t *testing.T) {
+	cl := newFakeCluster(t, qbPunch(), hathPunch())
+	cfg := testConfig(t, cl)
+	nat := newFakeNatmap()
+	a := newTestAgent(t, cfg, nat, &fakeNft{dumpBytes: []byte(nftDumpTwo)})
+	writeReport(t, cfg.StateDir, 27257, "120.244.157.23", 38698)
+	writeReport(t, cfg.StateDir, 27258, "120.244.157.23", 38699)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, 10*time.Millisecond) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(nat.Children()) != 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("children = %+v, want one per punch", nat.Children())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the context was cancelled")
+	}
+
+	stopped := map[int32]bool{}
+	for _, port := range nat.stops {
+		stopped[port] = true
+	}
+	if len(nat.stops) != 2 || !stopped[27257] || !stopped[27258] {
+		t.Errorf("stops = %v, want both children stopped", nat.stops)
+	}
+	if kids := nat.Children(); len(kids) != 0 {
+		t.Errorf("children = %+v, want none after Run returned", kids)
+	}
+	// The reports go with the children they described: a restart that kept them would
+	// announce a public port nothing owns any more.
+	for _, port := range []int32{27257, 27258} {
+		if _, err := os.Stat(ReportPath(cfg.StateDir, port)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("report for %d survived the stop: %v", port, err)
+		}
+	}
+}
+
+// TestRunSweepsLeftoversOnStartup is the belt's wiring: the sweep happens before the first
+// tick, so a device whose punchd was SIGKILLed gets its bind ports back before anything
+// tries to use them.
+func TestRunSweepsLeftoversOnStartup(t *testing.T) {
+	cl := newFakeCluster(t, qbPunch())
+	cfg := testConfig(t, cl)
+	root := t.TempDir()
+	writeProc(t, root, "4242", "natmap", "-b", "27257", "-e", NotifyPath(cfg.StateDir))
+
+	oldRoot, oldSignal := procRoot, signalProcess
+	procRoot = root
+	signalled := fakeKiller(t)
+	t.Cleanup(func() { procRoot, signalProcess = oldRoot, oldSignal })
+
+	a := newTestAgent(t, cfg, newFakeNatmap(), &fakeNft{dumpBytes: []byte(nftDumpOne)})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, 10*time.Millisecond) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(signalled(4242)) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Run did not sweep the natmap the previous punchd left behind")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the context was cancelled")
+	}
+	if sigs := signalled(4242); sigs[0] != syscall.SIGTERM {
+		t.Errorf("the leftover was signalled %v, want SIGTERM", sigs)
 	}
 }
 
@@ -343,6 +463,7 @@ func TestTickStopsWhatIsNoLongerDesiredAndDeletesTheTable(t *testing.T) {
 	cfg := testConfig(t, cl)
 	nat, nft := newFakeNatmap(), &fakeNft{dumpBytes: []byte(nftDumpOne)}
 	a := newTestAgent(t, cfg, nat, nft)
+	writeReport(t, cfg.StateDir, 27257, "120.244.157.23", 38698)
 	if err := a.Tick(t.Context()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
@@ -367,6 +488,11 @@ func TestTickStopsWhatIsNoLongerDesiredAndDeletesTheTable(t *testing.T) {
 	}
 	if post := cl.lastPost(t); len(post.Punches) != 0 {
 		t.Errorf("report = %+v, want an empty snapshot", post.Punches)
+	}
+	// The stopped child's report goes with it — a punch that comes back on the same
+	// bindPort must not be announced with the dropped child's public port.
+	if _, err := os.Stat(ReportPath(cfg.StateDir, 27257)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the removed punch's report survived: %v", err)
 	}
 }
 
