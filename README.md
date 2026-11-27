@@ -231,10 +231,12 @@ marker because the router also runs unrelated natmap instances (their own `-e`, 
 <fwmark>`), and killing every `/usr/bin/natmap` would take those down with it — the one thing
 an init script's `stop_service` cannot decide.
 
-Measured on the router (x86_64, ImmortalWrt 25.12.1) upgrading v0.2.1 to this: the old
-generation's two children were swept 40.560 s into the restart, the replacements bound at
-40.632 s, and the first tick reported `pending=2` / the next `up=2`. A clean restart stops both
-children in 1 ms, and a `kill -9` is cleaned up by procd's respawn plus the same sweep.
+Measured on the router (x86_64, ImmortalWrt 25.12.1) with the v0.2.2 build: `stopping` at
+10:39:28.136, `stopped every natmap child` one millisecond later, the replacements started
+120 ms after that, and the first tick reported `pending=2` at .375 — the next tick `up=2` on
+the same public ports. A `kill -9` (children reparented to init) is cleaned up by procd's 5 s
+respawn plus the same sweep: two WARN lines naming the pids, replacements bound, `up=2` on the
+next tick.
 
 ### The redirect, and the three traps
 
