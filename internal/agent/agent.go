@@ -185,10 +185,17 @@ func (a *Agent) Preflight() error {
 }
 
 // Run ticks immediately (so a boot self-heals without waiting) and then every interval.
+//
+// Both ends of its life own the natmap children. On the way in, a sweep kills what a
+// previous punchd left behind (it was SIGKILLed, so it never ran the shutdown below). On
+// ctx.Done() every child is stopped and waited for: the children are the agent's, and a
+// procd restart that left them behind would leave orphans holding the bind ports, so the
+// next generation could not map at all (issue #2).
 func (a *Agent) Run(ctx context.Context, interval time.Duration) error {
 	if err := a.Preflight(); err != nil {
 		return err
 	}
+	a.sweepLeftovers()
 	if interval <= 0 {
 		interval = a.cfg.Interval
 	}
@@ -206,9 +213,51 @@ func (a *Agent) Run(ctx context.Context, interval time.Duration) error {
 		select {
 		case <-ctx.Done():
 			a.log.Info("stopping")
+			a.stopChildren()
 			return nil
 		case <-ticker.C:
 		}
+	}
+}
+
+// sweepLeftovers kills the natmap children a previous punchd left behind. It runs before
+// the first tick, so the new generation starts on a device whose bind ports are free.
+func (a *Agent) sweepLeftovers() {
+	if a.natmap == nil {
+		return // -dry-run has no children to sweep
+	}
+	skip := map[int]bool{1: true, os.Getpid(): true}
+	sweepLeftovers(a.log, a.cfg.StateDir, skip)
+}
+
+// stopChildren is the shutdown path: stop every natmap child, wait for it to exit, and
+// delete the report each one left — the report describes a child that is gone, exactly as
+// in reconcileNatmaps, and a restart that kept it would announce a public port nothing
+// owns any more.
+func (a *Agent) stopChildren() {
+	if a.natmap == nil {
+		return
+	}
+	ports := ports(a.natmap)
+	if len(ports) == 0 {
+		return
+	}
+	if err := a.natmap.StopAll(); err != nil {
+		a.log.Error("cannot stop every natmap child", "err", err)
+		return
+	}
+	for _, port := range ports {
+		a.clearReport(port)
+	}
+	a.log.Info("stopped every natmap child", "ports", ports)
+}
+
+// clearReport deletes a stopped or dead child's report: natmap's `-e` script is
+// edge-triggered, so the replacement writes a new one only once it has a mapping, and
+// keeping the old file would announce the dead child's public port.
+func (a *Agent) clearReport(port int32) {
+	if err := os.Remove(ReportPath(a.cfg.StateDir, port)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		a.log.Warn("cannot clear the natmap's report", "bindPort", port, "err", err)
 	}
 }
 
@@ -409,9 +458,7 @@ func (a *Agent) reconcileNatmaps(desired []Desired) map[int32]error {
 			// The report belongs to the child that died: natmap's `-e` script is
 			// edge-triggered, so the replacement writes a new one only when it has a
 			// mapping. Keeping the old file would announce the dead child's public port.
-			if err := os.Remove(ReportPath(a.cfg.StateDir, d.BindPort)); err != nil && !errors.Is(err, os.ErrNotExist) {
-				a.log.Warn("cannot clear the dead natmap's report", "bindPort", d.BindPort, "err", err)
-			}
+			a.clearReport(d.BindPort)
 			a.log.Warn("natmap exited; restarting", "namespace", d.Namespace, "punch", d.Name,
 				"bindPort", d.BindPort, "err", c.Err)
 		}
@@ -437,6 +484,7 @@ func (a *Agent) reconcileNatmaps(desired []Desired) map[int32]error {
 			a.log.Error("cannot stop natmap", "bindPort", port, "err", err)
 			continue
 		}
+		a.clearReport(port)
 		a.log.Info("stopped natmap: no longer desired", "bindPort", port)
 	}
 	return childErrs
